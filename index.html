@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Box Breathing</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%);
+    }
+    
+    #start-button {
+      width: 100%;
+      height: 100vh;
+      font-size: 120px;
+      background: linear-gradient(135deg, rgba(72, 118, 255, 0.8), rgba(100, 80, 255, 0.9));
+      color: white;
+      border: none;
+      cursor: pointer;
+      transition: all 0.3s ease;
+      text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 0 50px rgba(72, 118, 255, 0.3);
+    }
+    
+    #start-button:hover {
+      background: linear-gradient(135deg, rgba(72, 118, 255, 0.9), rgba(100, 80, 255, 1.0));
+      box-shadow: 0 0 80px rgba(72, 118, 255, 0.5);
+    }
+
+    .webxr-hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+  <button id="start-button">🫁</button>
+
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    let camera, scene, renderer;
+    let analyser, dataArray;
+    let particles, particleMaterial;
+    let breathingSphere;
+    let breathingMaterial;
+    let controllers = [];
+    let xrSession = null;
+    const clock = new THREE.Clock();
+    let sessionStartTime = 0;
+    let breathingStarted = false;
+    let backgroundAudio;
+
+    // Breathing constants
+    const sessionDuration = 300; // 5 minutes
+    const boxTiming = 4; // 4-4-4-4 seconds
+    const cycleDuration = boxTiming * 4;
+    
+    // Clap to exit variables
+    let clapStartTime = 0;
+    let isClapDetected = false;
+    const CLAP_HOLD_DURATION = 2000;
+    const CLAP_DISTANCE_THRESHOLD = 0.15;
+
+    // Particle constants
+    const particleCount = 500;
+    const particleRadius = 3;
+
+    init();
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth/window.innerHeight, 0.01, 50);
+      renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0x404040, 1.2));
+      const dl = new THREE.DirectionalLight(0xffffff, 0.8); 
+      dl.position.set(1, 1, 1); 
+      scene.add(dl);
+
+      document.getElementById('start-button').addEventListener('click', startXR);
+      
+      window.addEventListener('resize', () => {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+    }
+
+    async function startXR() {
+      // Start background audio
+      if (!backgroundAudio) {
+        backgroundAudio = new Audio('background.mp3');
+        backgroundAudio.loop = true;
+        backgroundAudio.volume = 0.3;
+        try { await backgroundAudio.play(); } catch(e) { console.warn(e); }
+      }
+
+      if (!navigator.xr) {
+        alert('WebXR not supported');
+        return;
+      }
+      
+      const supported = await navigator.xr.isSessionSupported('immersive-ar');
+      if (!supported) {
+        alert('AR session not supported');
+        return;
+      }
+
+      const session = await navigator.xr.requestSession('immersive-ar', {
+        optionalFeatures: ['dom-overlay'],
+        domOverlay: { root: document.body }
+      });
+
+      onSessionStarted(session);
+    }
+
+    function onSessionStarted(session) {
+      xrSession = session;
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+
+      document.getElementById('start-button').classList.add('webxr-hidden');
+      
+      setupControllers(session);
+      createBreathingVisuals();
+      createParticles();
+      
+      // Setup microphone
+      navigator.mediaDevices.getUserMedia({audio: true, video: false}).then(stream => {
+        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const src = ctx.createMediaStreamSource(stream);
+        analyser = ctx.createAnalyser(); 
+        analyser.fftSize = 256; 
+        analyser.smoothingTimeConstant = 0.6;
+        dataArray = new Uint8Array(analyser.frequencyBinCount);
+        src.connect(analyser);
+      });
+
+      // Start breathing exercise immediately
+      breathingStarted = true;
+      sessionStartTime = clock.getElapsedTime();
+
+      renderer.setAnimationLoop(render);
+      session.addEventListener('end', onSessionEnd);
+    }
+
+    function setupControllers(session) {
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        scene.add(controller);
+        controllers.push(controller);
+      }
+    }
+
+    function createBreathingVisuals() {
+      // Central breathing sphere - main visual guide
+      const sphereGeometry = new THREE.SphereGeometry(0.8, 32, 32);
+      breathingMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+          time: { value: 0 },
+          breathPhase: { value: 0 }, // 0-1 breathing cycle
+          intensity: { value: 0.8 },
+          color1: { value: new THREE.Color(0x64acff) },
+          color2: { value: new THREE.Color(0xa864ff) },
+          color3: { value: new THREE.Color(0x84f7fd) }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          varying vec3 vNormal;
+          varying vec3 vPosition;
+          uniform float breathPhase;
+          uniform float time;
+          
+          void main() {
+            vUv = uv;
+            vNormal = normalize(normalMatrix * normal);
+            
+            // Breathing expansion/contraction
+            vec3 pos = position;
+            float scale = 0.7 + 0.6 * breathPhase;
+            pos *= scale;
+            
+            // Gentle pulse
+            pos += normal * sin(time * 2.0 + length(position) * 3.0) * 0.02;
+            
+            vPosition = pos;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform float time;
+          uniform float breathPhase;
+          uniform float intensity;
+          uniform vec3 color1;
+          uniform vec3 color2;
+          uniform vec3 color3;
+          varying vec2 vUv;
+          varying vec3 vNormal;
+          varying vec3 vPosition;
+          
+          void main() {
+            // Color transitions based on breath phase
+            vec3 color;
+            if (breathPhase < 0.25) {
+              // Inhale phase - blue to purple
+              color = mix(color1, color2, breathPhase * 4.0);
+            } else if (breathPhase < 0.5) {
+              // Hold phase - stable purple
+              color = color2;
+            } else if (breathPhase < 0.75) {
+              // Exhale phase - purple to cyan
+              color = mix(color2, color3, (breathPhase - 0.5) * 4.0);
+            } else {
+              // Hold phase - stable cyan
+              color = color3;
+            }
+            
+            // Fresnel effect
+            float fresnel = pow(1.0 - dot(normalize(vNormal), normalize(-vPosition)), 2.0);
+            
+            // Inner glow
+            float glow = sin(time + length(vPosition) * 2.0) * 0.3 + 0.7;
+            
+            float alpha = (fresnel * 0.8 + 0.2) * intensity * glow;
+            
+            gl_FragColor = vec4(color, alpha);
+          }
+        `,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide
+      });
+      
+      breathingSphere = new THREE.Mesh(sphereGeometry, breathingMaterial);
+      breathingSphere.position.set(0, 0, -2);
+      scene.add(breathingSphere);
+    }
+
+    function createParticles() {
+      const geo = new THREE.BufferGeometry();
+      const pos = [], col = [], siz = [], alp = [];
+      
+      for (let i = 0; i < particleCount; i++) {
+        // Spherical distribution around breathing sphere
+        const t = Math.random() * Math.PI * 2;
+        const p = Math.acos(2 * Math.random() - 1);
+        const r = Math.pow(Math.random(), 0.8) * particleRadius;
+        
+        const x = r * Math.sin(p) * Math.cos(t);
+        const y = r * Math.sin(p) * Math.sin(t);
+        const z = r * Math.cos(p) * 0.7 - 2; // Center around breathing sphere
+        pos.push(x, y, z);
+
+        // Color variety
+        const c = new THREE.Color();
+        const hue = 200 + Math.random() * 60; // Blue to purple range
+        c.setHSL(hue / 360, 0.8, 0.6);
+        col.push(c.r, c.g, c.b);
+
+        siz.push(0.02 + Math.random() * 0.03);
+        alp.push(0.3 + Math.random() * 0.7);
+      }
+      
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+      geo.setAttribute('customColor', new THREE.Float32BufferAttribute(col, 3));
+      geo.setAttribute('size', new THREE.Float32BufferAttribute(siz, 1));
+      geo.setAttribute('alpha', new THREE.Float32BufferAttribute(alp, 1));
+
+      particleMaterial = new THREE.ShaderMaterial({
+        uniforms: { 
+          pointTexture: { value: new THREE.TextureLoader().load('https://threejs.org/examples/textures/sprites/spark1.png') },
+          time: { value: 0 }, 
+          breathPhase: { value: 0 },
+          micIntensity: { value: 0 }
+        },
+        vertexShader: `
+          attribute float size;
+          attribute vec3 customColor;
+          attribute float alpha;
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float time;
+          uniform float breathPhase;
+          uniform float micIntensity;
+          
+          void main() {
+            vColor = customColor;
+            
+            vec3 p = position;
+            float d = length(position.xy);
+            
+            // Breathing movement - particles flow with breath
+            float breathMovement = sin(breathPhase * 3.14159) * 0.5;
+            p += normalize(position) * breathMovement;
+            
+            // Gentle floating
+            p.x += sin(time * 0.5 + position.z) * 0.1;
+            p.y += cos(time * 0.7 + position.x) * 0.1;
+            p.z += sin(time * 0.3 + position.y) * 0.05;
+            
+            // Mic responsiveness
+            if (d < 2.0) {
+              p += normalize(position) * micIntensity * 0.3;
+            }
+            
+            vAlpha = alpha * (0.5 + 0.5 * sin(breathPhase * 3.14159));
+            
+            vec4 mv = modelViewMatrix * vec4(p, 1.0);
+            gl_PointSize = size * (1.0 + micIntensity * 2.0) * (300.0 / -mv.z);
+            gl_Position = projectionMatrix * mv;
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D pointTexture;
+          varying vec3 vColor;
+          varying float vAlpha;
+          
+          void main() {
+            vec4 tex = texture2D(pointTexture, gl_PointCoord);
+            gl_FragColor = vec4(vColor, vAlpha * tex.a * 0.8);
+            if (gl_FragColor.a < 0.05) discard;
+          }
+        `,
+        transparent: true,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false
+      });
+
+      particles = new THREE.Points(geo, particleMaterial);
+      scene.add(particles);
+    }
+
+    function checkClapToExit() {
+      if (!xrSession || controllers.length < 2) return;
+      
+      const controller1 = controllers[0];
+      const controller2 = controllers[1];
+      
+      if (!controller1.visible || !controller2.visible) {
+        isClapDetected = false;
+        clapStartTime = 0;
+        return;
+      }
+      
+      const distance = controller1.position.distanceTo(controller2.position);
+      
+      if (distance <= CLAP_DISTANCE_THRESHOLD) {
+        if (!isClapDetected) {
+          isClapDetected = true;
+          clapStartTime = Date.now();
+        } else {
+          const holdDuration = Date.now() - clapStartTime;
+          if (holdDuration >= CLAP_HOLD_DURATION) {
+            endSession();
+            return;
+          }
+        }
+      } else {
+        isClapDetected = false;
+        clapStartTime = 0;
+      }
+    }
+
+    function endSession() {
+      if (xrSession) {
+        xrSession.end();
+      }
+    }
+
+    function onSessionEnd() {
+      breathingStarted = false;
+      document.getElementById('start-button').classList.remove('webxr-hidden');
+      
+      if (backgroundAudio) {
+        backgroundAudio.pause();
+        backgroundAudio.currentTime = 0;
+      }
+      
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+    }
+
+    function render() {
+      const delta = clock.getDelta();
+      const now = clock.getElapsedTime();
+
+      if (!breathingStarted) {
+        renderer.render(scene, camera);
+        return;
+      }
+
+      // Check clap to exit
+      checkClapToExit();
+
+      // Check session time limit
+      const elapsed = now - sessionStartTime;
+      if (elapsed >= sessionDuration) {
+        endSession();
+        return;
+      }
+
+      // Get microphone intensity
+      let micIntensity = 0;
+      if (analyser) {
+        analyser.getByteFrequencyData(dataArray);
+        let sum = 0;
+        for (let i = 2; i < 20; i++) sum += dataArray[i] * 1.5;
+        micIntensity = Math.pow(Math.min(1, (sum / 18) / 128), 0.7);
+      }
+
+      // Calculate breathing cycle
+      const cycleTime = elapsed % cycleDuration;
+      let breathPhase = 0;
+      
+      if (cycleTime < boxTiming) { 
+        // Inhale
+        breathPhase = cycleTime / boxTiming * 0.25;
+      } else if (cycleTime < boxTiming * 2) { 
+        // Hold after inhale
+        breathPhase = 0.25;
+      } else if (cycleTime < boxTiming * 3) {
+        // Exhale
+        breathPhase = 0.25 + ((cycleTime - boxTiming * 2) / boxTiming * 0.25);
+      } else { 
+        // Hold after exhale
+        breathPhase = 0.5;
+      }
+
+      // Smooth breathing phase for better visuals
+      const smoothPhase = (Math.sin((breathPhase * 4 - 1) * Math.PI / 2) + 1) / 2;
+
+      // Update breathing sphere
+      breathingMaterial.uniforms.time.value = now;
+      breathingMaterial.uniforms.breathPhase.value = smoothPhase;
+      breathingMaterial.uniforms.intensity.value = 0.6 + micIntensity * 0.4;
+
+      // Update particles
+      particleMaterial.uniforms.time.value = now;
+      particleMaterial.uniforms.breathPhase.value = smoothPhase;
+      particleMaterial.uniforms.micIntensity.value = micIntensity;
+
+      // Gentle rotation
+      breathingSphere.rotation.y += delta * 0.1;
+      particles.rotation.z += delta * 0.05;
+
+      renderer.render(scene, camera);
+    }
+  </script>
+</body>
+</html>
